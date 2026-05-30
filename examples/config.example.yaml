@@ -1,0 +1,3 @@
+default_provider: kie
+default_output: human
+database_url: sqlite:///home/your-user/.local/share/lontarax/lontarax.db
