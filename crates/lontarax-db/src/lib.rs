@@ -1,9 +1,10 @@
 pub mod repositories;
 
 use lontarax_core::{Config, LontaraXError, Result};
-use sqlx::{sqlite::SqlitePoolOptions, SqlitePool};
+use sqlx::{sqlite::SqliteConnectOptions, sqlite::SqlitePoolOptions, SqlitePool};
 use std::fs;
 use std::path::PathBuf;
+use std::str::FromStr;
 
 pub struct Database {
     pool: SqlitePool,
@@ -12,9 +13,12 @@ pub struct Database {
 impl Database {
     pub async fn connect(database_url: &str) -> Result<Self> {
         ensure_sqlite_parent_dir(database_url)?;
+        let connect_options = SqliteConnectOptions::from_str(database_url)
+            .map_err(|error| LontaraXError::InvalidDatabase(error.to_string()))?
+            .create_if_missing(true);
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
-            .connect(database_url)
+            .connect_with(connect_options)
             .await
             .map_err(|error| LontaraXError::InvalidDatabase(error.to_string()))?;
 
@@ -68,5 +72,28 @@ fn sqlite_path_from_url(database_url: &str) -> Option<PathBuf> {
         }
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+    use uuid::Uuid;
+
+    #[tokio::test]
+    async fn connect_creates_missing_sqlite_file() {
+        let temp_db = env::temp_dir().join(format!("lontarax-{}.db", Uuid::new_v4()));
+        let database_url = format!("sqlite://{}", temp_db.display());
+
+        if temp_db.exists() {
+            fs::remove_file(&temp_db).unwrap();
+        }
+
+        let db = Database::connect(&database_url).await.unwrap();
+        assert!(temp_db.exists(), "expected database file to be created");
+        drop(db);
+
+        fs::remove_file(&temp_db).unwrap();
     }
 }

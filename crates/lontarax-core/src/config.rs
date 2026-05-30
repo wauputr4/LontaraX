@@ -37,11 +37,22 @@ impl Config {
         Ok(base.join("lontarax").join("lontarax.db"))
     }
 
+    fn resolve_path(path: Option<&Path>) -> Result<PathBuf> {
+        if let Some(path) = path {
+            return Ok(path.to_path_buf());
+        }
+
+        if let Ok(value) = env::var("LONTARAX_CONFIG_PATH") {
+            if !value.trim().is_empty() {
+                return Ok(PathBuf::from(value));
+            }
+        }
+
+        Self::default_path()
+    }
+
     pub fn load(path: Option<&Path>) -> Result<Self> {
-        let path = match path {
-            Some(path) => path.to_path_buf(),
-            None => Self::default_path()?,
-        };
+        let path = Self::resolve_path(path)?;
 
         let mut config = if path.exists() {
             let raw = fs::read_to_string(&path)?;
@@ -55,10 +66,7 @@ impl Config {
     }
 
     pub fn save(&self, path: Option<&Path>) -> Result<PathBuf> {
-        let path = match path {
-            Some(path) => path.to_path_buf(),
-            None => Self::default_path()?,
-        };
+        let path = Self::resolve_path(path)?;
 
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -104,10 +112,21 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use tempfile::TempDir;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn reset_config_env() {
+        env::remove_var("LONTARAX_DEFAULT_PROVIDER");
+        env::remove_var("LONTARAX_DATABASE_URL");
+        env::remove_var("LONTARAX_CONFIG_PATH");
+    }
 
     #[test]
     fn save_and_load_roundtrip() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        reset_config_env();
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("config.yaml");
         let config = Config {
@@ -122,10 +141,13 @@ mod tests {
         assert_eq!(loaded.default_provider.as_deref(), Some("kie"));
         assert_eq!(loaded.default_output, OutputFormat::Json);
         assert_eq!(loaded.database_url.as_deref(), Some("sqlite::memory:"));
+        reset_config_env();
     }
 
     #[test]
     fn env_override_applies() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        reset_config_env();
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("missing.yaml");
 
@@ -134,12 +156,30 @@ mod tests {
 
         let loaded = Config::load(Some(&path)).unwrap();
 
-        unsafe {
-            env::remove_var("LONTARAX_DEFAULT_PROVIDER");
-            env::remove_var("LONTARAX_DATABASE_URL");
-        }
+        assert_eq!(loaded.default_provider.as_deref(), Some("kie"));
+        assert_eq!(loaded.database_url.as_deref(), Some("sqlite::memory:"));
+        reset_config_env();
+    }
+
+    #[test]
+    fn config_path_env_override_is_used_when_no_cli_path_is_given() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        reset_config_env();
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("override.yaml");
+        let config = Config {
+            default_provider: Some("kie".into()),
+            default_output: OutputFormat::Json,
+            database_url: Some("sqlite::memory:".into()),
+        };
+        fs::write(&config_path, serde_yaml::to_string(&config).unwrap()).unwrap();
+
+        env::set_var("LONTARAX_CONFIG_PATH", &config_path);
+        let loaded = Config::load(None).unwrap();
+        reset_config_env();
 
         assert_eq!(loaded.default_provider.as_deref(), Some("kie"));
+        assert_eq!(loaded.default_output, OutputFormat::Json);
         assert_eq!(loaded.database_url.as_deref(), Some("sqlite::memory:"));
     }
 }

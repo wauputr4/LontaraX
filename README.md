@@ -40,7 +40,7 @@ cargo build --release -p lontarax
 
 Binary output:
 - Linux/macOS: `target/release/lontarax`
-- Windows: `targetelease\lontarax.exe`
+- Windows: `target/release/lontarax.exe`
 
 ## Configuration
 
@@ -60,6 +60,7 @@ Environment overrides:
 - `LONTARAX_KIE_API_KEY`
 - `LONTARAX_DEFAULT_PROVIDER`
 - `LONTARAX_DATABASE_URL`
+- `LONTARAX_CONFIG_PATH`
 
 ## Quick start
 

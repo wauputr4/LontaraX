@@ -88,18 +88,10 @@ async fn init(
     config_path: Option<&std::path::Path>,
     json_output: bool,
 ) -> Result<()> {
-    let config_path = match config_path {
-        Some(path) => path.to_path_buf(),
-        None => Config::default_path()?,
-    };
-
-    if !config_path.exists() {
-        config.save(Some(&config_path))?;
-    }
-
+    let saved_config_path = config.save(config_path)?;
     let database_url = config.effective_database_url()?;
     let output = InitOutput {
-        config_path: config_path.display().to_string(),
+        config_path: saved_config_path.display().to_string(),
         database_url,
     };
 
