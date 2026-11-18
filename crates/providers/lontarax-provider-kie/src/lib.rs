@@ -10,6 +10,7 @@ use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::time::sleep;
 
 pub const DEFAULT_BASE_URL: &str = "https://api.kie.ai";
 const DOCS_INDEX_URL: &str = "https://docs.kie.ai/llms.txt";
@@ -197,6 +198,158 @@ impl KieProvider {
                 LontaraXError::Provider("Kie download-url response did not contain a string".into())
             })
     }
+
+    fn image_payload(&self, req: &ImageRequest) -> Value {
+        json!({
+            "model": req.model.as_str(),
+            "input": {
+                "prompt": req.prompt.as_str(),
+                "aspect_ratio": normalize_aspect_ratio(req.size.as_deref()),
+            },
+        })
+    }
+
+    async fn wait_for_image_task(&self, task_id: &str) -> Result<KieTaskRecord> {
+        let mut delay_secs = 2u64;
+        for _ in 0..60 {
+            let record = self.poll_task(task_id).await?;
+            match task_state(&record.data) {
+                Some("success") => return Ok(record),
+                Some("fail") => {
+                    return Err(LontaraXError::Provider(task_failure_message(
+                        task_id,
+                        &record.data,
+                    )));
+                }
+                Some("waiting") | Some("queuing") | Some("generating") => {}
+                Some(other) => {
+                    return Err(LontaraXError::Provider(format!(
+                        "Kie image task {task_id} returned unexpected state: {other}"
+                    )));
+                }
+                None => {
+                    if record.data.get("resultJson").is_some()
+                        || record.data.get("resultUrls").is_some()
+                    {
+                        return Ok(record);
+                    }
+                }
+            }
+            sleep(Duration::from_secs(delay_secs)).await;
+            delay_secs = (delay_secs * 2).min(10);
+        }
+
+        Err(LontaraXError::Timeout(format!(
+            "Kie image task {task_id} did not complete within the polling window"
+        )))
+    }
+}
+
+fn normalize_aspect_ratio(size: Option<&str>) -> String {
+    let Some(size) = size.map(str::trim).filter(|value| !value.is_empty()) else {
+        return "1:1".to_string();
+    };
+
+    if let Some((width, height)) = size.split_once('x').or_else(|| size.split_once('X')) {
+        if let (Ok(width), Ok(height)) = (width.trim().parse::<u64>(), height.trim().parse::<u64>())
+        {
+            if width == height {
+                return "1:1".to_string();
+            }
+            if width.saturating_mul(16) == height.saturating_mul(9) {
+                return "16:9".to_string();
+            }
+            if width.saturating_mul(9) == height.saturating_mul(16) {
+                return "9:16".to_string();
+            }
+            if width.saturating_mul(4) == height.saturating_mul(3) {
+                return "4:3".to_string();
+            }
+            if width.saturating_mul(3) == height.saturating_mul(4) {
+                return "3:4".to_string();
+            }
+        }
+    }
+
+    match size {
+        "1:1" | "4:3" | "3:4" | "16:9" | "9:16" => size.to_string(),
+        "square" => "1:1".to_string(),
+        "landscape" => "16:9".to_string(),
+        "portrait" => "9:16".to_string(),
+        _ => "1:1".to_string(),
+    }
+}
+
+fn task_state(data: &Value) -> Option<&str> {
+    for key in ["state", "status", "taskStatus"] {
+        if let Some(value) = data.get(key).and_then(Value::as_str) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn task_failure_message(task_id: &str, data: &Value) -> String {
+    let model = data
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let fail_code = data.get("failCode").and_then(Value::as_str).unwrap_or("");
+    let fail_msg = data.get("failMsg").and_then(Value::as_str).unwrap_or("");
+
+    match (fail_code.is_empty(), fail_msg.is_empty()) {
+        (true, true) => format!("Kie image task {task_id} ({model}) failed"),
+        (false, true) => format!("Kie image task {task_id} ({model}) failed: code={fail_code}"),
+        (true, false) => format!("Kie image task {task_id} ({model}) failed: {fail_msg}"),
+        (false, false) => {
+            format!("Kie image task {task_id} ({model}) failed: code={fail_code}, msg={fail_msg}")
+        }
+    }
+}
+
+fn collect_result_urls(value: &Value) -> Vec<String> {
+    let mut urls = Vec::new();
+
+    if let Some(result_urls) = value.get("resultUrls").and_then(Value::as_array) {
+        urls.extend(
+            result_urls
+                .iter()
+                .filter_map(|item| item.as_str().map(ToString::to_string)),
+        );
+    }
+
+    if urls.is_empty() {
+        if let Some(result_url) = value.get("resultUrl").and_then(Value::as_str) {
+            urls.push(result_url.to_string());
+        }
+    }
+
+    urls
+}
+
+fn extract_image_urls(data: &Value) -> Result<Vec<String>> {
+    if let Some(result_json) = data.get("resultJson").and_then(Value::as_str) {
+        if !result_json.trim().is_empty() {
+            let parsed: Value = serde_json::from_str(result_json).map_err(|error| {
+                LontaraXError::Provider(format!(
+                    "Kie image resultJson is not valid JSON: {error}; resultJson={result_json}"
+                ))
+            })?;
+            let urls = collect_result_urls(&parsed);
+            if !urls.is_empty() {
+                return Ok(urls);
+            }
+        }
+    }
+
+    let urls = collect_result_urls(data);
+    if urls.is_empty() {
+        return Err(LontaraXError::Provider(
+            "Kie image task completed successfully but no URLs were found".into(),
+        ));
+    }
+
+    Ok(urls)
 }
 
 #[async_trait]
@@ -228,10 +381,20 @@ impl AiProvider for KieProvider {
     }
 
     async fn image(&self, req: ImageRequest) -> Result<ImageResponse> {
-        let _ = req;
-        Err(LontaraXError::Provider(
-            "Kie image is TODO: wire the task-based image workflow once the final endpoint contract is confirmed".into(),
-        ))
+        let model = req.model.clone();
+        let payload = self.image_payload(&req);
+        let task = self.create_task("/api/v1/jobs/createTask", payload).await?;
+        let task_id = task.task_id;
+        let record = self.wait_for_image_task(&task_id).await?;
+        let urls = extract_image_urls(&record.data)?;
+
+        Ok(ImageResponse {
+            provider: self.name().into(),
+            model,
+            urls,
+            raw: record.data,
+            task_id: Some(task_id),
+        })
     }
 
     async fn video(&self, req: VideoRequest) -> Result<VideoResponse> {
@@ -474,6 +637,52 @@ mod tests {
             LontaraXError::Http { status, .. } => assert_eq!(status, 401),
             other => panic!("unexpected error: {other}"),
         }
+    }
+
+    #[tokio::test]
+    async fn image_task_workflow_parses_result_urls() {
+        let server = MockServer::start();
+        let task_id = "task_z-image_123";
+
+        let _create_mock = server.mock(|when, then| {
+            when.method(POST).path("/api/v1/jobs/createTask");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(format!(
+                    r#"{{"code":200,"msg":"success","data":{{"taskId":"{task_id}"}}}}"#
+                ));
+        });
+
+        let _status_mock = server.mock(|when, then| {
+            when.method(GET)
+                .path("/api/v1/jobs/recordInfo")
+                .query_param("taskId", task_id);
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(
+                    r#"{"code":200,"msg":"success","data":{"taskId":"task_z-image_123","model":"z-image","state":"success","resultJson":"{\"resultUrls\":[\"https://example.com/generated-content.jpg\"]}","failCode":"","failMsg":"","costTime":15000,"completeTime":1698765432000,"createTime":1698765400000,"updateTime":1698765432000,"progress":100}}"#,
+                );
+        });
+
+        let provider = KieProvider::new(server.url(""), "sk-test").unwrap();
+        let response = provider
+            .image(ImageRequest {
+                model: "z-image".into(),
+                prompt: "a cat".into(),
+                n: 1,
+                size: None,
+                metadata_json: Value::Null,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(response.provider, "kie");
+        assert_eq!(response.model, "z-image");
+        assert_eq!(response.task_id.as_deref(), Some(task_id));
+        assert_eq!(
+            response.urls,
+            vec!["https://example.com/generated-content.jpg".to_string()]
+        );
     }
 
     #[tokio::test]
