@@ -114,4 +114,4 @@ lontarax models --provider kie
 
 - Output defaults to human-readable, with `--json` for machine-readable output.
 - Secrets are masked in provider listings.
-- Kie image/video/chat workflows are scaffolded and ready for task-based endpoint wiring.
+- Kie image workflow is wired via task-based create/poll flow; chat/video remain scaffolded.
